@@ -1,0 +1,336 @@
+# boxmot/qdrant/qdrant_long_reid.py
+import numpy as np
+import uuid
+from uuid import uuid5
+from typing import Dict, Tuple, Optional, List
+
+# Qdrant (optional)
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.http.models import (
+        Distance, VectorParams, PointStruct, Filter,
+        FieldCondition, MatchValue, FilterSelector,
+        SearchRequest, SearchGroupsRequest
+    )
+    _HAVE_QDRANT = True
+except Exception:
+    _HAVE_QDRANT = False
+
+
+def l2_norm(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float32)
+    n = float(np.linalg.norm(v)) + 1e-6
+    return (v / n).astype(np.float32)
+
+# ----------------------------
+# Local in-memory ring buffer
+# ----------------------------
+class LocalLongBank:
+    """
+    (run_uid, track_id) -> ring buffer của size `slots`.
+    Mỗi slot lưu (vector, frame_id).
+    """
+    def __init__(self, dim: int = 512, slots: int = 32):
+        self.dim   = int(dim)
+        self.slots = int(slots)
+        self._store: Dict[Tuple[str, int], Dict[int, Tuple[np.ndarray, int]]] = {}
+
+    def add_ring(self, run_uid: str, track_id: int, vector: np.ndarray,
+                 slot: int, extra: Optional[dict] = None) -> str:
+        key = (run_uid, int(track_id))
+        vec = l2_norm(vector)
+        slot = int(slot) % self.slots
+        if key not in self._store:
+            self._store[key] = {}
+        frame_id = int(extra.get("frame_id", 0)) if extra else 0
+        self._store[key][slot] = (vec, frame_id)
+        # pseudo id
+        return f"local:{run_uid}:{int(track_id)}:{slot}"
+
+    def delete_track(self, run_uid: str, track_id: int):
+        self._store.pop((run_uid, int(track_id)), None)
+
+    def get_slot_vector(self, run_uid: str, track_id: int, slot: int):
+        """Lấy đúng vector và frame theo slot."""
+        key = (run_uid, int(track_id))
+        d = self._store.get(key)
+        if not d:
+            return None, None
+        slot = int(slot) % self.slots
+        if slot not in d:
+            return None, None
+        vec, fr = d[slot]
+        return vec.copy(), int(fr)
+
+    def get_all_vectors(self, run_uid: str, track_id: int, limit: int = 100):
+        key = (run_uid, int(track_id))
+        d = self._store.get(key)
+        if not d:
+            return None
+        # sort theo frame_id để ổn định
+        items = sorted(d.items(), key=lambda kv: kv[1][1])
+        vecs = [it[1][0] for it in items][:int(limit)]
+        return np.stack(vecs, axis=0) if vecs else None
+
+    def get_vectors_with_payload(self, run_uid: str, track_id: int, page_size: int = 128):
+        """Giữ nguyên signature cũ: trả (vecs, frames)."""
+        key = (run_uid, int(track_id))
+        d = self._store.get(key)
+        if not d:
+            return None, None
+        items = sorted(d.items(), key=lambda kv: kv[1][1])
+        vecs   = [it[1][0] for it in items]
+        frames = [it[1][1] for it in items]
+        if not vecs:
+            return None, None
+        return np.stack(vecs, axis=0), np.asarray(frames, dtype=np.int64)
+
+    def get_vectors_frames_slots(self, run_uid: str, track_id: int):
+        """Mới: trả (vecs, frames, slots) đã sắp theo frame tăng dần."""
+        key = (run_uid, int(track_id))
+        d = self._store.get(key)
+        if not d:
+            return None, None, None
+        items = sorted(d.items(), key=lambda kv: kv[1][1])
+        slots  = [it[0] for it in items]
+        vecs   = [it[1][0] for it in items]
+        frames = [it[1][1] for it in items]
+        if not vecs:
+            return None, None, None
+        return np.stack(vecs, axis=0), np.asarray(frames, dtype=np.int64), np.asarray(slots, dtype=np.int32)
+
+    def centroid(self, run_uid: str, track_id: int):
+        """Trung bình cộng (mean) các vector hiện có của track."""
+        V = self.get_all_vectors(run_uid, track_id)
+        if V is None or len(V) == 0:
+            return None
+        c = V.mean(axis=0)
+        return l2_norm(c)
+
+
+# ----------------------------
+# Qdrant remote ring buffer
+# ----------------------------
+class QdrantLongBank:
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 6333,
+        collection: str = "long_term_reid",
+        dim: int = 512,
+        slots: int = 32,
+    ):
+        if not _HAVE_QDRANT:
+            raise RuntimeError("qdrant-client not installed")
+        self.client = QdrantClient(host=host, port=port)
+        self.collection = collection
+        self.dim = int(dim)
+        self.slots = int(slots)
+        self._uuid_ns = uuid.uuid5(uuid.NAMESPACE_DNS, "boxmot.long_term_reid")
+        self._ensure_collection()
+
+    def _ensure_collection(self):
+        collections = [c.name for c in self.client.get_collections().collections]
+        if self.collection not in collections:
+            self.client.recreate_collection(
+                collection_name=self.collection,
+                vectors_config=VectorParams(size=self.dim, distance=Distance.COSINE),
+            )
+
+    def _recreate_with_dim(self, new_dim: int):
+        self.dim = int(new_dim)
+        self.client.recreate_collection(
+            collection_name=self.collection,
+            vectors_config=VectorParams(size=self.dim, distance=Distance.COSINE),
+        )
+
+    # ---- helpers ----
+    def _point_id(self, run_uid: str, track_id: int, slot: int) -> str:
+        name = f"{run_uid}:{int(track_id)}:{int(slot) % self.slots}"
+        return str(uuid5(self._uuid_ns, name))
+
+    # ---- API ----
+    def add_ring(self, run_uid: str, track_id: int, vector: np.ndarray,
+                 slot: int, extra: Optional[dict] = None) -> str:
+        """Upsert theo ring-buffer (id theo run_uid/track_id/slot)."""
+        point_id = self._point_id(run_uid, track_id, slot)
+        payload = {"run_uid": run_uid, "track_id": int(track_id), "slot": int(slot) % self.slots}
+        if extra:
+            payload.update(extra)
+
+        v = l2_norm(vector)
+        try:
+            self.client.upsert(
+                collection_name=self.collection,
+                points=[PointStruct(id=point_id, vector=v.tolist(), payload=payload)],
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            # auto-fix wrong vector size by recreating with the correct dim
+            if any(k in msg for k in ["vector size", "incompatible", "wrong"]):
+                try:
+                    self._recreate_with_dim(len(v))
+                    self.client.upsert(
+                        collection_name=self.collection,
+                        points=[PointStruct(id=point_id, vector=v.tolist(), payload=payload)],
+                    )
+                except Exception as ee:
+                    print(f"[QdrantLongBank.add_ring] recreate+upsert FAILED: {ee} | id={point_id}")
+                    raise
+            else:
+                print(f"[QdrantLongBank.add_ring] upsert FAILED: {e} | id={point_id}")
+                raise
+        return point_id
+
+    def delete_track(self, run_uid: str, track_id: int):
+        flt = Filter(must=[
+            FieldCondition(key="run_uid", match=MatchValue(value=run_uid)),
+            FieldCondition(key="track_id", match=MatchValue(value=int(track_id))),
+        ])
+        self.client.delete(collection_name=self.collection, points_selector=FilterSelector(filter=flt))
+
+    def get_slot_vector(self, run_uid: str, track_id: int, slot: int):
+        """Lấy đúng vector và frame theo slot bằng retrieve(id)."""
+        pid = self._point_id(run_uid, track_id, slot)
+        try:
+            pts = self.client.retrieve(
+                collection_name=self.collection,
+                ids=[pid], with_payload=True, with_vectors=True
+            )
+            if not pts:
+                return None, None
+            v  = np.asarray(pts[0].vector, dtype=np.float32)
+            fr = int(pts[0].payload.get("frame_id", 0))
+            return v, fr
+        except Exception:
+            return None, None
+
+    def get_all_vectors(self, run_uid: str, track_id: int, limit: int = 100):
+        """Lấy tối đa `limit` vector của track (không đảm bảo đủ tất cả slot nếu > limit)."""
+        flt = Filter(must=[
+            FieldCondition(key="run_uid", match=MatchValue(value=run_uid)),
+            FieldCondition(key="track_id", match=MatchValue(value=int(track_id))),
+        ])
+        points, _ = self.client.scroll(
+            collection_name=self.collection,
+            scroll_filter=flt, with_vectors=True, limit=int(limit)
+        )
+        if not points:
+            return None
+        return np.stack([np.asarray(p.vector, dtype=np.float32) for p in points], axis=0)
+
+    def get_vectors_with_payload(self, run_uid: str, track_id: int, page_size: int = 128):
+        """
+        Giữ nguyên signature cũ: trả (vecs, frames).
+        Gợi ý: dùng get_vectors_frames_slots() nếu cần cả slots.
+        """
+        flt = Filter(must=[
+            FieldCondition(key="run_uid", match=MatchValue(value=run_uid)),
+            FieldCondition(key="track_id", match=MatchValue(value=int(track_id))),
+        ])
+        offset = None
+        vecs: List[np.ndarray] = []
+        frames: List[int] = []
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=flt, with_vectors=True,
+                limit=int(page_size), offset=offset
+            )
+            if not points:
+                break
+            for p in points:
+                vecs.append(np.asarray(p.vector, dtype=np.float32))
+                frames.append(int(p.payload.get("frame_id", 0)))
+            if offset is None:
+                break
+        if not vecs:
+            return None, None
+        # sắp theo frame tăng dần cho ổn định
+        order = np.argsort(np.asarray(frames, dtype=np.int64))
+        V = np.stack(vecs, axis=0)[order]
+        F = np.asarray(frames, dtype=np.int64)[order]
+        return V, F
+
+    def get_vectors_frames_slots(self, run_uid: str, track_id: int, page_size: int = 128):
+        """
+        Mới: trả (vecs, frames, slots), sắp theo frame tăng dần.
+        """
+        flt = Filter(must=[
+            FieldCondition(key="run_uid", match=MatchValue(value=run_uid)),
+            FieldCondition(key="track_id", match=MatchValue(value=int(track_id))),
+        ])
+        offset = None
+        vecs: List[np.ndarray] = []
+        frames: List[int] = []
+        slots: List[int] = []
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection,
+                scroll_filter=flt, with_vectors=True,
+                limit=int(page_size), offset=offset
+            )
+            if not points:
+                break
+            for p in points:
+                vecs.append(np.asarray(p.vector, dtype=np.float32))
+                frames.append(int(p.payload.get("frame_id", 0)))
+                slots.append(int(p.payload.get("slot", -1)))
+            if offset is None:
+                break
+        if not vecs:
+            return None, None, None
+        order = np.argsort(np.asarray(frames, dtype=np.int64))
+        V = np.stack(vecs, axis=0)[order]
+        F = np.asarray(frames, dtype=np.int64)[order]
+        S = np.asarray(slots , dtype=np.int32)[order]
+        return V, F, S
+
+    def centroid(self, run_uid: str, track_id: int):
+        """Trung bình cộng (mean) các vector hiện có của track."""
+        V, F = self.get_vectors_with_payload(run_uid, track_id)
+        if V is None or len(V) == 0:
+            return None
+        c = V.mean(axis=0)
+        return l2_norm(c)
+
+
+# ----------------------------
+# Hybrid adapter
+# ----------------------------
+class HybridLongBank:
+    """
+    Ưu tiên Qdrant (nếu bật & có), nếu lỗi thì fallback LocalLongBank.
+    API: add_ring, delete_track, centroid, get_all_vectors,
+         get_vectors_with_payload, get_slot_vector, get_vectors_frames_slots
+    """
+    def __init__(
+        self,
+        use_qdrant: bool = True,
+        host: str = "localhost",
+        port: int = 6333,
+        collection: str = "long_term_reid",
+        dim: int = 512,
+        slots: int = 32,
+    ):
+        self.slots = int(slots)
+        if use_qdrant and _HAVE_QDRANT:
+            try:
+                self.backend = QdrantLongBank(host=host, port=port, collection=collection, dim=dim, slots=slots)
+                self.backend_name = "qdrant"
+            except Exception as e:
+                print(f"[HybridLongBank] Qdrant init failed, fallback to Local. Reason: {e}")
+                self.backend = LocalLongBank(dim=dim, slots=slots)
+                self.backend_name = "local"
+        else:
+            self.backend = LocalLongBank(dim=dim, slots=slots)
+            self.backend_name = "local"
+
+    # proxy
+    def add_ring(self, *args, **kwargs): return self.backend.add_ring(*args, **kwargs)
+    def delete_track(self, *args, **kwargs): return self.backend.delete_track(*args, **kwargs)
+    def centroid(self, *args, **kwargs): return self.backend.centroid(*args, **kwargs)
+    def get_all_vectors(self, *args, **kwargs): return self.backend.get_all_vectors(*args, **kwargs)
+    def get_vectors_with_payload(self, *args, **kwargs): return self.backend.get_vectors_with_payload(*args, **kwargs)
+    def get_slot_vector(self, *args, **kwargs): return self.backend.get_slot_vector(*args, **kwargs)
+    def get_vectors_frames_slots(self, *args, **kwargs): return self.backend.get_vectors_frames_slots(*args, **kwargs)
