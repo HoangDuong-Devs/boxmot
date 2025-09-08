@@ -50,10 +50,10 @@ conda activate trackers_test
 ## 4. Luồng hoạt động (Pipeline workflow)
 
 ### Luồng gốc (boxmot/trackers/botsort/original/botsort.py)
-![alt text](image.png)
+![alt text](<original_botsort .png>)
 
 ### Luồng mới (boxmot/trackers/botsort/botsort_pending_idsd.py)
-![alt text](image-1.png)
+![!\[alt text\](image-1.png)](new_botsort.png)
 
 ## 5. Cấu hình (Configs) boxmot/configs/trackers/botsort.yaml
 
