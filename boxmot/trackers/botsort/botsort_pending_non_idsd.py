@@ -167,7 +167,7 @@ class BotSort(BaseTracker):
         self.pending_manager = PendingManager(
             kalman_filter              =self.kalman_filter,
             min_lost_matches_to_promote=5,
-            promotion_deadline         =15,
+            promotion_deadline         =18,
             iou_thresh                 =0.7,
             appearance_thresh          =0.10,
             match_thresh               =0.7,
@@ -178,7 +178,7 @@ class BotSort(BaseTracker):
             dw_step_frames             =self.dw_step_frames,
             dw_step_delta              =self.dw_step_delta,
             reid_dim                   =reid_dim,
-            promote_min_frames_for_lost=5,
+            promote_min_frames_for_lost=9,
             proto_provider             =self._bank_centroid_for_track,
             vectors_provider           =self._bank_vectors_for_track,
             long_bank_topk             =self.long_bank_topk,

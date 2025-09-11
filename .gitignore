@@ -59,3 +59,5 @@ boxmot/motion/cmc/*.jpg
 *_output.json
 
 test_video/
+
+*.avi
