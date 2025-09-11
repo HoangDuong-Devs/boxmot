@@ -169,7 +169,7 @@ class PendingManager:
                  iou_thresh=0.7, appearance_thresh=0.1, match_thresh=0.8, use_dynamic_weights=True,
                 w_motion_base=0.6, w_motion_start_dw=0.6, dw_start_frames=20, dw_step_frames=20,
                 dw_step_delta=0.05, reid_dim=None, dw_app_split=0.5, promote_min_frames_for_lost=5, 
-                proto_provider=None, vectors_provider=None, long_topk_k=5, debug_pending_lost=False,
+                proto_provider=None, vectors_provider=None, long_bank_topk=5, debug_pending_lost=False,
                 qdrant_group_provider=None):
         self.pending_tracks = []
         self.kalman_filter  = kalman_filter
@@ -191,7 +191,7 @@ class PendingManager:
         self.promote_min_frames_for_lost = int(promote_min_frames_for_lost)
         self.proto_provider      = proto_provider
         self.vectors_provider    = vectors_provider
-        self.long_topk_k         = int(long_topk_k)
+        self.long_bank_topk         = int(long_bank_topk)
         
         self.debug_pending_lost  = bool(debug_pending_lost)
         
@@ -290,7 +290,7 @@ class PendingManager:
                 queries = P[valid_rows]                 # (m_valid, D)
                 lost_ids = [int(getattr(t, "id", -1)) for t in lost_tracks]
                 run_uid  = self.run_uid
-                resp = self.qdrant_group_provider(run_uid, lost_ids, queries, k=self.long_topk_k)
+                resp = self.qdrant_group_provider(run_uid, lost_ids, queries, k=self.long_bank_topk)
                 if resp is not None:
                     C = np.ones((M, N), dtype=np.float32)
                     for r_idx, dmap in zip(valid_rows, resp):
@@ -312,7 +312,7 @@ class PendingManager:
         if N == 0:
             return np.ones((M, 0), dtype=np.float32)
         C = np.ones((M, N), dtype=np.float32)
-        k_req = max(1, int(self.long_topk_k))
+        k_req = max(1, int(self.long_bank_topk))
         for j, lost in enumerate(lost_tracks):
             V = None
             if self.vectors_provider is not None:

@@ -69,13 +69,11 @@ class BotSort(BaseTracker):
         fuse_first_associate: bool  = False,
         with_reid           : bool  = True,
         # Qdrant parameters
-        use_qdrant          : bool = True,
-        qdrant_host         : str = "localhost",
-        qdrant_port         : int = 6333,
-        qdrant_collection   : str ="long_term_reid",
-        bank_slots          : int = 20,
-        
-        
+        use_qdrant          : bool  = True,
+        qdrant_host         : str   = "localhost",
+        qdrant_port         : int   = 6333,
+        qdrant_collection   : str   ="long_term_reid",
+        bank_slots          : int   = 20,
     ):
         super().__init__(per_class=per_class)
         self.lost_stracks    = []  # type: list[STrack]
@@ -127,7 +125,7 @@ class BotSort(BaseTracker):
         self.max_obs = 50
         
         reid_dim = getattr(self.model, "feature_dim", 512) if self.with_reid and self.model else None
-        self.long_topk_k = 5   # số điểm trong bank để pooling
+        self.long_bank_topk = 5   # số điểm trong bank để pooling
         
         self.pending_manager = PendingManager(
             kalman_filter              =self.kalman_filter,
@@ -147,7 +145,7 @@ class BotSort(BaseTracker):
             promote_min_frames_for_lost=5,
             proto_provider             =self._bank_centroid_for_track,
             vectors_provider           =self._bank_vectors_for_track,
-            long_topk_k                =self.long_topk_k,
+            long_bank_topk             =self.long_bank_topk,
             debug_pending_lost         =True
         )
         
@@ -190,8 +188,8 @@ class BotSort(BaseTracker):
         # --- suspect/holder voting config --- 
         self.suspect_consec     = 7  # tự cost > ngưỡng trong 7 frame liên tiếp
         self.holder_vote_win    = 10 # cửa sổ 10 frame để vote holder
-        self.holder_vote_need   = 5 # cần ≥5 lần pass trong cửa sổ để xác nhận
-        self.no_motion_cooldown = 5 # số frame chặn association với track vừa bị tách
+        self.holder_vote_need   = 5  # cần ≥5 lần pass trong cửa sổ để xác nhận
+        self.no_motion_cooldown = 5  # số frame chặn association với track vừa bị tách
         self.use_cooldown       = False   # <--- Tắt cooldown tạm thời
         
             
@@ -450,7 +448,7 @@ class BotSort(BaseTracker):
             C = np.ones((M, N), dtype=np.float32)
             for i, t in enumerate(tracks):
                 V = self._bank_vectors_for_track(t)  # (N_i, D) hoặc None
-                row = self._track_det_topk_cost_row(V, D, dvalid, k=self.long_topk_k)
+                row = self._track_det_topk_cost_row(V, D, dvalid, k=self.long_bank_topk)
                 C[i, :] = row
             return np.clip(C, 0.0, 1.0, out=C)
         

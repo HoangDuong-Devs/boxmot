@@ -120,16 +120,13 @@ class BotSort(BaseTracker):
         self.dw_step_frames  = 20
         self.dw_step_delta   = 0.05
         
-        self.long_update_cos_thresh = 0.12
+        self.occlusion_overlap_thresh = 0.45 # Diện tích bị che -> không cập nhật
+        self.long_update_cos_thresh = 0.12   # Feature drift    -> không cập nhật
         self.max_obs = 50
         
         reid_dim = getattr(self.model, "feature_dim", 512) if self.with_reid and self.model else None
-        self.long_topk_k = 5   # số điểm trong bank để pooling
-        
-        self.occlusion_overlap_thresh = 0.45 # Diện tích bị che -> không cập nhật
-        
-        self.coex_map = {}   # id -> set các id đã từng cùng xuất hiện (active_track và lost_track)                
-                
+        self.long_bank_topk = 5   # số điểm trong bank để pooling
+                                
         # --- Long Feature Bank (REPLACE) ---
         import uuid as _uuid
         self.run_uid    = _uuid.uuid4().hex[:8]
@@ -137,8 +134,10 @@ class BotSort(BaseTracker):
 
         # cache & ring-slot cho từng track id
         self._slot_pos           = {}
-        self._bank_proto_cache   = {}
-        self._bank_proto_ttl     = 5
+        
+        # Centroid cache (TTL=5f): giảm fetch/tính mean; clear khi add new feat.
+        self._bank_proto_cache   = {} 
+        self._bank_proto_ttl     = 5 
 
         self.overlap_calc = OptimizedOverlapCalculator()
         
@@ -158,10 +157,13 @@ class BotSort(BaseTracker):
                 print(f"[LongBank] init failed, disabled. Reason: {e}")
                 self.long_bank = None
 
+
+        self.coex_map = {}   # id -> set các id đã từng cùng xuất hiện (active_track và lost_track)              
+
         qprov = (lambda run_uid, lost_ids, queries, k:
                 self.long_bank.grouped_topk_mean(run_uid, lost_ids, queries, k)
                 ) if (self.long_bank and self.long_bank.backend_name == "qdrant") else None
-                
+              
         self.pending_manager = PendingManager(
             kalman_filter              =self.kalman_filter,
             min_lost_matches_to_promote=5,
@@ -179,18 +181,21 @@ class BotSort(BaseTracker):
             promote_min_frames_for_lost=5,
             proto_provider             =self._bank_centroid_for_track,
             vectors_provider           =self._bank_vectors_for_track,
-            long_topk_k                =self.long_topk_k,
+            long_bank_topk             =self.long_bank_topk,
             debug_pending_lost         =True,
             qdrant_group_provider      =qprov,  # không cần truyền use_qdrant_server  
         )        
         
         self.pending_manager.run_uid = self.run_uid
         
-        self._frame_cache_bank = {} #  {tid: (frame_id, V)} cache V của từng track 1-2 frame
+        self._frame_cache_bank = {} # Vectors cache (1–2 frame): tránh query Qdrant lặp trong cùng frame.
+        
+        # Top-k vectors cache (TTL=3f): tránh cắt/lấy lại nhiều lần trong matching.
+        self._topk_cache = {}
+        self._cache_ttl  = 4 
         
         self.debug_long = True  # bật debug
-        self._topk_cache = {}
-        self._cache_ttl  = 3 
+        
         # -----------------------------------
             
     # ------------- Long Bank Helpers ---------------
@@ -247,7 +252,6 @@ class BotSort(BaseTracker):
 
         except Exception as e:
             print(f"[LongBank] add feature failed for id={getattr(track,'id',-1)}: {e}")
-
 
     def _bank_centroid_for_track(self, track: STrack):
         """
@@ -308,7 +312,7 @@ class BotSort(BaseTracker):
                 ctx_all, self.frame_count, threshold=self.occlusion_overlap_thresh
             )
 
-    def allow_update(self, long_val, track, other_tracks=None):
+    def allow_update(self, long_val, track):
         long_th = float(getattr(self, "long_update_cos_thresh", 0.15))
         occ_th  = float(getattr(self, "occlusion_overlap_thresh", 0.45))
 
@@ -319,16 +323,11 @@ class BotSort(BaseTracker):
             info = self.overlap_calc.get_result(track)
             occluded = bool(info.get("is_occluded", False))
         except Exception:
-            if other_tracks:
-                try:
-                    occluded = self._occluded_heavily(track, other_tracks, thresh=occ_th)
-                except Exception:
-                    occluded = False
+            occluded = False
 
         allow_short = True
         allow_long  = bool(allow_short and long_ok and (not occluded))
         return allow_short, allow_long, occluded
-
 
     def _occlusion_context(self, exclude_id=None, predict_pending=False):
         """Lấy danh sách đối tượng có thể gây che khuất: active (Tracked) + pending."""
@@ -481,23 +480,13 @@ class BotSort(BaseTracker):
 
         C = np.ones((M, N), dtype=np.float32)
         for i, t in enumerate(tracks):
-            V = self._get_cached_topk_vectors(t, self.long_topk_k)
+            V = self._get_cached_topk_vectors(t, self.long_bank_topk)
             if V is None or V.size == 0:
                 continue
-            row = self._track_det_topk_cost_row_optimized(V, D, dvalid, self.long_topk_k)
+            row = self._track_det_topk_cost_row_optimized(V, D, dvalid, self.long_bank_topk)
             C[i, :] = row
 
-        return np.clip(C, 0.0, 1.0)
-
-    def _occluded_heavily(self, track, other_tracks, thresh=None):
-        """Check if track is heavily occluded by other tracks."""
-        if thresh is None:
-            thresh = getattr(self, "occlusion_overlap_thresh", 0.5)
-        try:
-            ratio = self._max_overlap_ratio(track, other_tracks)
-            return ratio >= float(thresh)
-        except Exception:
-            return False            
+        return np.clip(C, 0.0, 1.0)          
 
     @BaseTracker.setup_decorator
     @BaseTracker.per_class_decorator
@@ -508,8 +497,6 @@ class BotSort(BaseTracker):
         self.check_inputs(dets, img, embs)
         self.frame_count += 1
         
-        self._build_overlap_cache_for_frame()
-
         activated_stracks, refind_stracks, lost_stracks, removed_stracks = [], [], [], []
 
         # --- 1. Preprocess detections ---
@@ -605,6 +592,17 @@ class BotSort(BaseTracker):
         # --- 6. Add new pending ---
         if unmatched_dets:
             self.pending_manager.add_pending(unmatched_dets, self.frame_count, feats=unmatched_feats, img=img)
+        
+        # --- 6.5. Cập nhật coexistence cho frame hiện tại (trước khi promote) ---
+        try:
+            live_now = [t for t in self.active_tracks if t.state == TrackState.Tracked]
+            # thêm các track vừa khẳng định lại trong frame này
+            live_now += [t for t in activated_stracks if t.state == TrackState.Tracked]
+            live_now += [t for t in refind_stracks     if t.state == TrackState.Tracked]
+            if live_now:
+                self._update_coexistence_simple(live_now)
+        except Exception as e:
+            print(f"Error updating coexistence (pre-promote): {e}")
             
         # --- 7. Promote pending ---
         promotables = self.pending_manager.promote_pending(self.frame_count)
@@ -811,6 +809,13 @@ class BotSort(BaseTracker):
         STrack.multi_gmc(strack_pool, warp)
         STrack.multi_gmc(unconfirmed, warp)
 
+
+        # Build occlusion cache with latest predicted boxes (Tracked + Pending predicted)
+        try:
+            self._build_overlap_cache_for_frame()
+        except Exception:
+            pass
+            
         # IoU distance
         ious_dists = iou_distance(strack_pool, detections)
         ious_dists_mask = ious_dists > self.proximity_thresh
@@ -858,17 +863,10 @@ class BotSort(BaseTracker):
             track.long_reid_cost = float(long_cost[itracked, idet])
             track.final_cost     = float(C[itracked, idet])
                  
-            # Build context occlusion: active + pending (đã predict), lọc theo class nếu cần
-            other_tracks_for_occlusion = self._occlusion_context(
-                exclude_id=getattr(track, "id", None),
-                predict_pending=False,
-            )
-            
             # Check update permissions
             allow_short, allow_long, occluded = self.allow_update(
                 long_cost[itracked, idet] if self.with_reid else None,
                 track,
-                other_tracks=other_tracks_for_occlusion
             )
             
             track._is_occluded = bool(occluded)
@@ -974,14 +972,9 @@ class BotSort(BaseTracker):
             track.reid_cost      = float(reid_cost_mat[itracked, idet]) if reid_cost_mat is not None else 1.0
             track.long_reid_cost = float(long_cost_mat[itracked, idet]) if long_cost_mat is not None else float("nan")
 
-            other_tracks_for_occlusion = self._occlusion_context(
-                exclude_id=getattr(track, "id", None),
-                predict_pending=False,
-            )
             _, _, occluded2 = self.allow_update(
                 long_val=None,
                 track=track,
-                other_tracks=other_tracks_for_occlusion,
             )
             track._is_occluded = bool(occluded2)
 
@@ -1114,29 +1107,3 @@ class BotSort(BaseTracker):
 
         return np.asarray(outputs, dtype=np.float32) if outputs else np.empty((0, 8), dtype=np.float32), logs, tracks_for_visual
                    
-    def _max_overlap_ratio(self, track, other_tracks):
-        """Calculate max overlap ratio between track and other tracks."""
-        try:
-            box1 = track.xyxy
-            area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-            max_ratio = 0.0
-
-            for other in other_tracks:
-                if getattr(other, 'id', None) == getattr(track, 'id', None):
-                    continue
-                if not hasattr(other, 'xyxy'):
-                    continue
-                
-                box2 = other.xyxy
-                xA = max(box1[0], box2[0])
-                yA = max(box1[1], box2[1])
-                xB = min(box1[2], box2[2])
-                yB = min(box1[3], box2[3])
-                inter_area = max(0, xB - xA) * max(0, yB - yA)
-                if inter_area > 0:
-                    ratio = inter_area / area1
-                    if ratio > max_ratio:
-                        max_ratio = ratio
-            return max_ratio
-        except Exception:
-            return 0.0
