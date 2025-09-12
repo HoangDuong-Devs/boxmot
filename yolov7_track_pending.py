@@ -20,6 +20,16 @@ from yolov7.utils.datasets      import letterbox
 from yolov7.models.experimental import attempt_load
 from yolov7.utils.general       import non_max_suppression, scale_coords
 
+from qdrant_client import QdrantClient
+
+def clear_qdrant_collection(name="long_term_reid"):
+    try:
+        client = QdrantClient(host="localhost", port=6333)
+        client.delete_collection(name)
+        print(f"[INFO] Qdrant collection '{name}' deleted successfully.")
+    except Exception as e:
+        print("f[WARN] could not delete collection '{name}: {e}")
+
 @dataclass
 class TrackingConfig:
     source      : str   = r"/home/duonghn/boxmot_rebuild1/test_video/aicity.mp4"
@@ -158,6 +168,7 @@ def visualize_full_hd(video_frame, tracks, rows=6, cols=5, padding=5, text_heigh
 
 def run_tracking(cfg: TrackingConfig) -> None:
     selected_device = torch.device("cuda:0")
+    clear_qdrant_collection("long_term_reid")
     print(f"[INFO] Using device: {selected_device}")
 
     model = attempt_load(cfg.weights, map_location="cpu")
@@ -209,8 +220,8 @@ def run_tracking(cfg: TrackingConfig) -> None:
         ret, frame = cap.read()
         if not ret:
             break
-        print(f"Frame: {frame_idx}")
         frame_idx += 1
+        print(f"Frame: {frame_idx}")
         curr_time = time.time()
         fps_real = 1.0 / (curr_time - prev_time)
         avg_fps = frame_idx / (curr_time - start_time)  # FPS trung bình tính tại thời điểm này

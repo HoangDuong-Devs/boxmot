@@ -1,9 +1,8 @@
-# botsort_pending_v2.py
+# botsort_pending_non_idsd.py
 
 from pathlib import Path
 from collections import deque
 import numpy as np
-import cv2
 import torch
 
 from boxmot.appearance.reid.auto_backend import ReidAutoBackend
@@ -28,6 +27,7 @@ from boxmot.utils.matching import (
 
 from boxmot.trackers.botsort.pending_manager import PendingManager
 from boxmot.qdrant.qdrant_long_reid import HybridLongBank
+from boxmot.trackers.botsort.botsort_utils import OptimizedOverlapCalculator
 
 class BotSort(BaseTracker):
     """
@@ -74,7 +74,6 @@ class BotSort(BaseTracker):
         qdrant_port         : int = 6333,
         qdrant_collection   : str ="long_term_reid",
         bank_slots          : int = 20,
-        
     ):
         super().__init__(per_class=per_class)
         self.lost_stracks    = []  # type: list[STrack]
@@ -120,50 +119,27 @@ class BotSort(BaseTracker):
         self.dw_start_frames = 0    
         self.dw_step_frames  = 20
         self.dw_step_delta   = 0.05
-        self.dw_app_split    = 0.5
         
-        self.long_update_cos_thresh = 0.12
+        self.occlusion_overlap_thresh = 0.45 # Diện tích bị che -> không cập nhật
+        self.long_update_cos_thresh   = 0.12 # Feature drift    -> không cập nhật
         self.max_obs = 50
         
         reid_dim = getattr(self.model, "feature_dim", 512) if self.with_reid and self.model else None
-        self.long_topk_k = 5   # số điểm trong bank để pooling
-        
-        self.pending_manager = PendingManager(
-            kalman_filter              =self.kalman_filter,
-            min_lost_matches_to_promote=5,
-            promotion_deadline         =15,
-            iou_thresh                 =0.7,
-            appearance_thresh          =0.12,
-            match_thresh               =0.7,
-            use_dynamic_weights        =self.use_dynamic_weights,
-            w_motion_base              =self.w_motion_base,
-            w_motion_start_dw          =self.w_motion_start_dw,
-            dw_start_frames            =self.dw_start_frames,
-            dw_step_frames             =self.dw_step_frames,
-            dw_step_delta              =self.dw_step_delta,
-            reid_dim                   =reid_dim,
-            dw_app_split               =self.dw_app_split,
-            promote_min_frames_for_lost=5,
-            proto_provider             =self._bank_centroid_for_track,
-            vectors_provider           =self._bank_vectors_for_track,
-            long_topk_k                =self.long_topk_k,
-            debug_pending_lost         =True
-        )
-        
-        self.occlusion_overlap_thresh = 0.45 # Diện tích bị che -> không cập nhật
-        
-        self.coex_map = {}   # id -> set các id đã từng cùng xuất hiện (active_track và lost_track)                
-                
+        self.long_bank_topk = 5   # số điểm trong bank để pooling
+                                
         # --- Long Feature Bank (REPLACE) ---
         import uuid as _uuid
         self.run_uid    = _uuid.uuid4().hex[:8]
         self.bank_slots = int(bank_slots)
 
-        # cache & ring-slot cho từng track id
+        # Ring-slot cho từng track id
         self._slot_pos           = {}
-        self._bank_proto_cache   = {}
-        self._bank_proto_ttl     = 5
+        # Centroid cache (TTL=5f): giảm fetch/tính mean; clear khi add new feat.
+        self._bank_proto_cache   = {} 
+        self._bank_proto_ttl     = 5 
 
+        self.overlap_calc = OptimizedOverlapCalculator()
+        
         self.long_bank = None
         if self.with_reid and reid_dim:
             try:
@@ -179,40 +155,119 @@ class BotSort(BaseTracker):
             except Exception as e:
                 print(f"[LongBank] init failed, disabled. Reason: {e}")
                 self.long_bank = None
-                
-        self._frame_cache_bank = {} #  {tid: (frame_id, V)} cache V của từng track 1-2 frame
+
+
+        self.coex_map = {}   # id -> set các id đã từng cùng xuất hiện (active_track và lost_track)              
+
+        qprov = (lambda run_uid, lost_ids, queries, k:
+                self.long_bank.grouped_topk_mean(run_uid, lost_ids, queries, k)
+                ) if (self.long_bank and self.long_bank.backend_name == "qdrant") else None
+              
+        self.pending_manager = PendingManager(
+            kalman_filter              =self.kalman_filter,
+            promotion_deadline         =15,
+            iou_thresh                 =0.7,
+            appearance_thresh          =0.12,
+            match_thresh               =0.7,
+            use_dynamic_weights        =self.use_dynamic_weights,
+            w_motion_base              =self.w_motion_base,
+            w_motion_start_dw          =self.w_motion_start_dw,
+            dw_start_frames            =self.dw_start_frames,
+            dw_step_frames             =self.dw_step_frames,
+            dw_step_delta              =self.dw_step_delta,
+            reid_dim                   =reid_dim,
+            promote_min_frames_for_lost=5,
+            proto_provider             =self._bank_centroid_for_track,
+            vectors_provider           =self._bank_vectors_for_track,
+            long_bank_topk             =self.long_bank_topk,
+            debug_pending_lost         =True,
+            qdrant_group_provider      =qprov,  # không cần truyền use_qdrant_server  
+        )        
+        
+        self.pending_manager.run_uid = self.run_uid
+        
+        self._frame_cache_bank = {} # Vectors cache (1–2 frame): tránh query Qdrant lặp trong cùng frame.
+        
+        # Top-k vectors cache (TTL=3f): tránh cắt/lấy lại nhiều lần trong matching.
+        self._topk_cache = {}
+        self._cache_ttl  = 4 
+        
+        self.debug_long = True  # bật debug
+        
+        # --- IDSD related state (from idsd variant) ---
+        self._idswap_locked_pairs = set()
+        self._idswap_locked_ids = set()
+
+        # suspect/holder voting config (defaults copied from idsd variant)
+        self.suspect_consec     = 7
+        self.holder_vote_win    = 10
+        self.holder_vote_need   = 5
+        self.no_motion_cooldown = 5
+        self.use_cooldown       = False
+
+        # IDS-d safety
+        self.quarantine_frames = 8
+        self.safe_bank_margin  = 0.8
+
+        # single-match debug
+        self.debug_single = False
+        self.single_lost_match_thresh = float(getattr(self, "long_update_cos_thresh", 0.12))
+
+        self.self_recover_scale = 1.0
         # -----------------------------------
-        
-        self._idswap_locked_pairs = set()  
-        self._idswap_locked_ids   = set()
-        
-        # --- suspect/holder voting config --- 
-        self.suspect_consec     = 7  # tự cost > ngưỡng trong 7 frame liên tiếp
-        self.holder_vote_win    = 10 # cửa sổ 10 frame để vote holder
-        self.holder_vote_need   = 5 # cần ≥5 lần pass trong cửa sổ để xác nhận
-        self.no_motion_cooldown = 5 # số frame chặn association với track vừa bị tách
-        self.use_cooldown       = False   # <--- Tắt cooldown tạm thời
-        
             
     # ------------- Long Bank Helpers ---------------
     def _bank_next_slot(self, tid: int) -> int:
         pos = self._slot_pos.get(int(tid), 0)
         self._slot_pos[int(tid)] = (pos + 1) % self.bank_slots
         return pos
-    
+        
     def _bank_add_feature(self, track: STrack, feat: np.ndarray):
-        """Push one vector into bank ring-buffer (if available)."""
+        """
+        Add a feature to the long-term bank with safety checks:
+        - validate & L2-norm feat
+        - compare to current bank centroid (if any)
+        - skip push if cosine distance > self.long_update_cos_thresh
+        - ring-slot upsert + proto cache invalidate
+        """
         if self.long_bank is None or (not self.with_reid) or feat is None:
             return
         try:
             v = np.asarray(feat, dtype=np.float32).ravel()
-            if not np.isfinite(v).all() or v.size == 0:
+            if v.size == 0 or not np.isfinite(v).all():
                 return
+
+            # L2-normalize (backends also L2-normalize, nhưng normalize sớm giúp so cos chính xác)
+            n = np.linalg.norm(v)
+            if (not np.isfinite(n)) or n < 1e-6:
+                return
+            if abs(n - 1.0) > 0.01:
+                v = v / n
+
+            # (optional) reject outliers vs current centroid
+            th = float(getattr(self, "long_update_cos_thresh", 0.15))  # distance in [0,1]
+            try:
+                proto_vec, ok = self._bank_centroid_for_track(track)
+            except Exception:
+                proto_vec, ok = (None, False)
+
+            safe_to_push = True
+            if ok and proto_vec is not None:
+                # proto_vec đã chuẩn hoá trong _bank_centroid_for_track
+                s = float(np.clip(np.dot(v, np.asarray(proto_vec, np.float32).ravel()), -1.0, 1.0))
+                cos_dist = 0.5 * (1.0 - s)
+                safe_to_push = (cos_dist <= th)
+
+            if not safe_to_push:
+                return
+
             slot = self._bank_next_slot(track.id)
             extra = {"frame_id": int(self.frame_count), "cls": int(getattr(track, "cls", 0))}
             self.long_bank.add_ring(self.run_uid, int(track.id), v, slot, extra=extra)
-            # invalidate centroid cache for this track (recompute soon)
+
+            # invalidate centroid cache cho track này
             self._bank_proto_cache.pop(int(track.id), None)
+
         except Exception as e:
             print(f"[LongBank] add feature failed for id={getattr(track,'id',-1)}: {e}")
 
@@ -229,7 +284,9 @@ class BotSort(BaseTracker):
                 if v is not None:
                     v = np.asarray(v, dtype=np.float32).ravel()
                     n = np.linalg.norm(v) + 1e-6
-                    return (v / n), True
+                    if np.isfinite(n) and n > 1e-6 and abs(n - 1.0) > 0.01:
+                        v = v / n
+                    return v.astype(np.float32), True
             return None, False
 
         # cache
@@ -262,63 +319,35 @@ class BotSort(BaseTracker):
                 return c, True
 
         return None, False
-    
-    def _build_tracks_bank_matrix(self, tracks):
-        """
-        Build matrix T (M x D) from bank centroids for given tracks.
-        Returns T, tvalid(bool mask)
-        """
-        M = len(tracks)
-        if M == 0:
-            return None, np.zeros((0,), dtype=bool)
 
-        vecs = []
-        valid = []
-        dim  = None
-        for t in tracks:
-            v, ok = self._bank_centroid_for_track(t)
-            if ok and v is not None:
-                v = np.asarray(v, dtype=np.float32).ravel()
-                if dim is None:
-                    dim = v.size
-                if v.size != dim:
-                    # dimension mismatch -> invalidate
-                    v = None
-                    ok = False
-            vecs.append(v)
-            valid.append(bool(ok))
+    def _build_overlap_cache_for_frame(self):
+        # gom toàn bộ Tracked + Pending, không lọc theo class
+        ctx_all = self._occlusion_context(
+            exclude_id=None, predict_pending=False
+        )
+        if ctx_all:    
+            self.overlap_calc.build_cache_for_context(
+                ctx_all, self.frame_count, threshold=self.occlusion_overlap_thresh
+            )
 
-        if dim is None:
-            return None, np.asarray(valid, dtype=bool)
-
-        T = np.zeros((M, dim), dtype=np.float32)
-        for i, v in enumerate(vecs):
-            if v is not None:
-                T[i, :] = v
-        return T, np.asarray(valid, dtype=bool)    
-
-    def allow_update(self, long_val, track, other_tracks=None):
-        """Check if track updates are allowed based on vảious conditions."""
+    def allow_update(self, long_val, track):
         long_th = float(getattr(self, "long_update_cos_thresh", 0.15))
         occ_th  = float(getattr(self, "occlusion_overlap_thresh", 0.45))
-        
-        long_ok = True
-        if long_val is not None:
-            long_ok = long_val <= long_th
-            
-        occluded = False
-        if other_tracks:
-            try:
-                occluded = self._occluded_heavily(track, [t for t in other_tracks if t.id != track.id], thresh=occ_th)
-            except Exception:
-                occluded = False
-                
+
+        long_ok = True if long_val is None else (long_val <= long_th)
+
+        occluded = False  # <-- thêm dòng này
+        try:
+            info = self.overlap_calc.get_result(track)
+            occluded = bool(info.get("is_occluded", False))
+        except Exception:
+            occluded = False
+
         allow_short = True
-        allow_long  = bool(allow_short and long_ok and(not occluded))
-        
+        allow_long  = bool(allow_short and long_ok and (not occluded))
         return allow_short, allow_long, occluded
 
-    def _occlusion_context(self, exclude_id=None, cls_ref=None, predict_pending=True):
+    def _occlusion_context(self, exclude_id=None, predict_pending=False):
         """Lấy danh sách đối tượng có thể gây che khuất: active (Tracked) + pending."""
         ctx = []
         # Active đang Tracked
@@ -343,31 +372,29 @@ class BotSort(BaseTracker):
         except Exception:
             pass
 
-        # per-class filtering
-        if cls_ref is not None:
-            ctx = [o for o in ctx if getattr(o, "cls", None) == cls_ref]
-
         return ctx
     
     def _update_coexistence_simple(self, tracks):
-        """Record all pairs of IDs that coexist in current frame."""
+        """Optimized coexistence tracking."""
         try:
+            # Filter once instead of in loop
             live = [t for t in tracks if t.state == TrackState.Tracked]
-            lock = getattr(self, "_idswap_locked_ids", set())  # IDs thuộc cụm nghi ngờ ở frame này
-            n = len(live)
+            live_ids = [int(t.id) for t in live]
+            n = len(live_ids)
+            
+            # Pre-allocate sets
+            for ida in live_ids:
+                if ida not in self.coex_map:
+                    self.coex_map[ida] = set()
+            
+            # Single loop for all pairs
             for i in range(n):
-                ida = int(live[i].id)
-                self.coex_map.setdefault(ida, set())
+                ida = live_ids[i]
                 for j in range(i + 1, n):
-                    idb = int(live[j].id)
-                    if idb == ida:
-                        continue
-                    # chỉ chặn coexistence giữa các ID đều đang bị nghi ngờ
-                    if ida in lock or idb in lock:
-                        continue
-                    self.coex_map.setdefault(idb, set())
-                    self.coex_map[ida].add(idb)
-                    self.coex_map[idb].add(ida)
+                    idb = live_ids[j]
+                    if ida != idb:
+                        self.coex_map[ida].add(idb)
+                        self.coex_map[idb].add(ida)
         except Exception as e:
             print(f"Error in coexistence update: {e}")
                 
@@ -407,88 +434,204 @@ class BotSort(BaseTracker):
             pass
         return None
 
-    def _track_det_topk_cost_row(self, V, D, dvalid, k=8):
-        """
-        Tính cost cho 1 track (với bank V) tới tất cả detections D (N_det, D).
-        Trả về: row cost shape (N_det,), cost = 0.5*(1 - mean_topk_cos).
-        """
-        N = 0 if D is None else D.shape[0]
-        if V is None or N == 0:
-            return np.ones((N,), dtype=np.float32)
-        try:
-            # S = V @ D^T => (N_i, N_det)
-            S = V @ D.T
-            np.clip(S, -1.0, 1.0, out=S)
-            k_use = min(int(k), int(S.shape[0]))
-            if k_use <= 0:
-                return np.ones((N,), dtype=np.float32)
-            # Top-k theo cột (theo detection): n_i nhỏ (≤ bank_slots), sort là đủ nhanh
-            topk = np.sort(S, axis=0)[-k_use:, :]   # (k_use, N_det)
-            sims = topk.mean(axis=0)                # (N_det,)
-            cost = 0.5 * (1.0 - sims)
-            # Vô hiệu các detection không có feat hợp lệ
-            cost = np.where(dvalid, cost, 1.0).astype(np.float32, copy=False)
-            return cost
-        except Exception:
-            return np.ones((N,), dtype=np.float32)
+    def _get_cached_topk_vectors(self, track, k: int):
+        """Lấy tối đa k vector gần nhất từ bank, có cache TTL ngắn theo frame."""
+        tid = int(getattr(track, 'id', -1))
+        if tid < 0:
+            return None
 
-    def _compute_long_cost(self, tracks, dets):
-        """Long-term cost với top-k pooling trên vector bank: cost = 0.5*(1 - mean_topk_cos)."""
-        M, N = len(tracks), len(dets)
-        if M == 0 or N == 0:
-            return np.ones((M, N), dtype=np.float32)
-        try:
-            # Lấy ma trận đặc trưng detections (ưu tiên curr_feat -> smooth_feat)
-            
-            D, dvalid = build_feat_matrix(dets  , ("curr_feat", "smooth_feat"))
-            if D is None:
-                return np.ones((M, N), dtype=np.float32)
-            
-            D = D / np.clip(np.linalg.norm(D, axis=1, keepdims=True), 1e-6, None)
-            
-            C = np.ones((M, N), dtype=np.float32)
-            for i, t in enumerate(tracks):
-                V = self._bank_vectors_for_track(t)  # (N_i, D) hoặc None
-                row = self._track_det_topk_cost_row(V, D, dvalid, k=self.long_topk_k)
-                C[i, :] = row
-            return np.clip(C, 0.0, 1.0, out=C)
-        
-        except Exception as e:
-            print(f"Error computing long cost (top-k): {e}")
-            return np.ones((M, N), dtype=np.float32)
-            
-    def _occluded_heavily(self, track, other_tracks, thresh=None):
-        """Check if track is heavily occluded by other tracks."""
-        if thresh is None:
-            thresh = getattr(self, "occlusion_overlap_thresh", 0.5)
-        try:
-            ratio = self._max_overlap_ratio(track, other_tracks)
-            return ratio >= float(thresh)
-        except Exception:
-            return False            
+        key = (tid, self.frame_count)
+        v = self._topk_cache.get(key)
+        if v is not None:
+            return v
 
-    def _compute_iou(self, box1, box2):
-        """Compute IoU between two boxes."""
+        V = self._bank_vectors_for_track(track)  # đã có cache 1–2 frame ở _frame_cache_bank
+        if V is None or V.size == 0:
+            self._topk_cache[key] = None
+            # dọn cache cũ
+            old = [kk for kk in self._topk_cache if self.frame_count - kk[1] > self._cache_ttl]
+            for kk in old: self._topk_cache.pop(kk, None)
+            return None
+
+        # lấy k vector cuối (coi như mới nhất)
+        if V.shape[0] > k:
+            V = V[-k:]
+        self._topk_cache[key] = V
+
+        # dọn cache cũ
+        old = [kk for kk in self._topk_cache if self.frame_count - kk[1] > self._cache_ttl]
+        for kk in old: self._topk_cache.pop(kk, None)
+        return V
+
+    # ---------- IDSD helper methods (ported/adapted) ---------
+    def _try_match_single_to_lost_long_only(self, single_track: STrack, lost_pool, img=None) -> bool:
         try:
-            x1 = max(box1[0], box2[0])
-            y1 = max(box1[1], box2[1])
-            x2 = min(box1[2], box2[2])
-            y2 = min(box1[3], box2[3])
-            
-            inter = max(0, x2 - x1) * max(0, y2 - y1)
-            if inter <= 0:
-                return 0.0
-                
-            area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-            area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-            union = area1 + area2 - inter
-            
-            return inter / max(union, 1e-6)
+            curr_id = int(getattr(single_track, "id", -1))
+            thr = float(getattr(self, "single_lost_match_thresh",
+                                getattr(self, "appearance_thresh", 0.25)))
+
+            if not lost_pool:
+                return False
+
+            # Long-term cost (1 single column) using existing compute
+            C = self._compute_long_cost(lost_pool, [single_track]).ravel()
+            C = np.nan_to_num(C, nan=1.0, posinf=1.0, neginf=1.0)
+
+            # Debug top-1 costs
+            if getattr(self, 'debug_single', False):
+                metric_name = f"long_topk_mean_cos(k={int(getattr(self,'long_bank_topk',5))})"
+                has_any_bank = False
+                try:
+                    for lt in lost_pool:
+                        V = self._bank_vectors_for_track(lt)
+                        if V is not None and len(V) > 0:
+                            has_any_bank = True
+                            break
+                except Exception:
+                    has_any_bank = False
+
+                if C.size > 0:
+                    pre_best_idx = int(np.argmin(C))
+                    pre_best_cost = float(C[pre_best_idx])
+                    pre_best_id = int(getattr(lost_pool[pre_best_idx], "id", -1))
+                else:
+                    pre_best_idx = -1
+                    pre_best_cost = float('nan')
+                    pre_best_id = -1
+
+                if not has_any_bank:
+                    print(f"[DBG][frame={self.frame_count}] single->lost id={curr_id} | metric={metric_name} "
+                        f"| status=no_valid_bank (all cost=1.000) | top1: lost_id={pre_best_id} cost={pre_best_cost:.3f}",
+                        flush=True)
+                else:
+                    pre_best_sim = max(0.0, min(1.0, 1.0 - 2.0 * pre_best_cost)) if np.isfinite(pre_best_cost) else float('nan')
+                    print(f"[DBG][frame={self.frame_count}] single->lost id={curr_id} | metric={metric_name} "
+                        f"| top1(pre-gate): lost_id={pre_best_id} cost={pre_best_cost:.3f} mean_topk_cos={pre_best_sim:.3f}",
+                        flush=True)
+
+            # Gate by coexistence
+            coex_block = self.coex_map.get(curr_id, set())
+            gated_idx = -1
+            for j, lt in enumerate(lost_pool):
+                lid = int(getattr(lt, "id", -1))
+                if lid in coex_block:
+                    C[j] = 1.0
+                    gated_idx = j
+
+            jbest = int(np.argmin(C)) if C.size else -1
+            if jbest < 0:
+                return False
+
+            best_cost = float(C[jbest])
+            best_lost_id = int(getattr(lost_pool[jbest], "id", -1))
+
+            if getattr(self, 'debug_single', False):
+                metric_name = f"long_topk_mean_cos(k={int(getattr(self,'long_bank_topk',5))})"
+                best_sim = max(0.0, min(1.0, 1.0 - 2.0 * best_cost)) if np.isfinite(best_cost) else float('nan')
+                extra = ""
+                if gated_idx >= 0:
+                    extra = " | coexistence_gate=applied"
+                print(f"[DBG][frame={self.frame_count}] single->lost id={curr_id} | metric={metric_name}"
+                    f"{extra} | top1(after-gate): lost_id={best_lost_id} cost={best_cost:.3f} mean_topk_cos={best_sim:.3f} thr={thr:.3f}",
+                    flush=True)
+
+            if best_cost > thr:
+                return False
+
+            # Re-activate lost track
+            lost_trk = lost_pool[jbest]
+            lost_trk.re_activate(single_track, self.frame_count, new_id=False, img=img)
+            lost_trk.quarantined_until = 0
+            if single_track in getattr(self, "active_tracks", []):
+                self.active_tracks.remove(single_track)
+
+            # Push safe vector to bank if allowed
+            if self.with_reid:
+                feat_for_bank = getattr(lost_trk, "curr_feat", None) or getattr(single_track, "curr_feat", None)
+                if feat_for_bank is not None:
+                    proto_vec, ok = self._bank_centroid_for_track(lost_trk)
+                    safe = True
+                    if ok and proto_vec is not None:
+                        safe = (self._cos_cost_simple(feat_for_bank, proto_vec)
+                                <= float(getattr(self, "long_update_cos_thresh", 0.15)))
+                    if safe and (int(lost_trk.id) not in getattr(self, "_idswap_locked_ids", set())):
+                        self._bank_add_feature(lost_trk, feat_for_bank)
+            return True
         except Exception:
-            return 0.0
+            return False
+
+    def _build_tracks_bank_matrix(self, tracks):
+        M = len(tracks)
+        if M == 0:
+            return None, np.zeros((0,), dtype=bool)
+
+        vecs = []
+        valid = []
+        dim = None
+        for t in tracks:
+            v, ok = self._bank_centroid_for_track(t)
+            if ok and v is not None:
+                v = np.asarray(v, dtype=np.float32).ravel()
+                if dim is None:
+                    dim = v.size
+                if v.size != dim:
+                    v = None
+                    ok = False
+            vecs.append(v)
+            valid.append(bool(ok))
+
+        if dim is None:
+            return None, np.asarray(valid, dtype=bool)
+
+        T = np.zeros((M, dim), dtype=np.float32)
+        for i, v in enumerate(vecs):
+            if v is not None:
+                T[i, :] = v
+        return T, np.asarray(valid, dtype=bool)
+
+    def _snapshot_track(self, t):
+        try:
+            if getattr(t, "_snap_taken", False):
+                return
+            snap = {
+                "frame_id": getattr(t, "frame_id", None),
+                "xyxy": getattr(t, "xyxy", None).copy() if hasattr(t, "xyxy") else None,
+                "mean": getattr(t, "mean", None).copy() if hasattr(t, "mean") else None,
+                "cov": getattr(t, "covariance", None).copy() if hasattr(t, "covariance") else None,
+            }
+            t._snapshot = snap
+            t._snap_taken = True
+        except Exception:
+            pass
+
+    def _revert_to_snapshot(self, t):
+        try:
+            snap = getattr(t, "_snapshot", None)
+            if not snap:
+                return
+            if snap.get("xyxy") is not None:
+                t.xyxy = snap["xyxy"].copy()
+            if snap.get("mean") is not None and hasattr(t, "mean"):
+                t.mean = snap["mean"].copy()
+            if snap.get("cov") is not None and hasattr(t, "covariance"):
+                t.covariance = snap["cov"].copy()
+        except Exception:
+            pass
+
+    def _idsd_mark_lost(self, t: STrack, lost_stracks: list, reason: str = "idsd"):
+        self._revert_to_snapshot(t)
+        if t.state != TrackState.Lost:
+            t.mark_lost()
+        t._just_lost_in_frame = self.frame_count
+        t.quarantined_until = self.frame_count + int(getattr(self, "quarantine_frames", 8))
+        t._lost_reason = reason
+        if t in self.active_tracks:
+            self.active_tracks.remove(t)
+        if lost_stracks is not None:
+            lost_stracks.append(t)
 
     def _cos_cost_simple(self, a, b):
-        if a is None or b is None: 
+        if a is None or b is None:
             return 1.0
         a = np.asarray(a, np.float32).ravel()
         b = np.asarray(b, np.float32).ravel()
@@ -498,71 +641,12 @@ class BotSort(BaseTracker):
 
     def _feat_of(self, t):
         return first_not_none(getattr(t, "curr_feat", None), getattr(t, "smooth_feat", None))
-    
-    def _try_match_single_to_lost_long_only(self, single_track: STrack, lost_pool, img=None) -> bool:
-        """
-        Reclaim ID cho 'single_track' từ lost_pool chỉ bằng long-term
-        """
-        try:
-            if not lost_pool:
-                return False
 
-            # 1) Tính long cost giữa LOST (tracks) và SINGLE (như 1 detection)
-            #    _compute_long_cost(tracks, dets) => shape (len(lost_pool), 1)
-            C = self._compute_long_cost(lost_pool, [single_track])
-            C = np.nan_to_num(C, nan=1.0, posinf=1.0, neginf=1.0).ravel()  # (N,)
-
-            # 2) Chặn các LOST từng "đồng xuất hiện" với ID hiện tại (coexistence guard)
-            curr_id = int(getattr(single_track, "id", -1))
-            coex_block = self.coex_map.get(curr_id, set())
-            for j, lt in enumerate(lost_pool):
-                lid = int(getattr(lt, "id", -1))
-                if lid in coex_block:
-                    C[j] = 1.0  # block
-
-            # 3) Chọn best theo ngưỡng long-term
-            #    Gợi ý: dùng cùng thang đo cost (0..1) như appearance_thresh,
-            #    hoặc tạo riêng self.long_reclaim_thresh nếu muốn chặt hơn.
-            long_thr = float(getattr(self, "appearance_thresh", 0.25))
-            jbest = int(np.argmin(C))
-            if C[jbest] <= long_thr:
-                lost_trk = lost_pool[jbest]
-
-                # re-activate LOST bằng đo hiện tại của single_track
-                lost_trk.re_activate(single_track, self.frame_count, new_id=False, img=img)
-
-                # Nếu single đang nằm trong active thì gỡ ra
-                if single_track in getattr(self, "active_tracks", []):
-                    self.active_tracks.remove(single_track)
-
-                # Đẩy 1 vector an toàn về bank (tuỳ chọn)
-                if self.with_reid:
-                    feat_for_bank = getattr(lost_trk, "curr_feat", None) or getattr(single_track, "curr_feat", None)
-                    if feat_for_bank is not None:
-                        proto_vec, ok = self._bank_centroid_for_track(lost_trk)
-                        safe = True
-                        if ok and proto_vec is not None:
-                            safe = (self._cos_cost_simple(feat_for_bank, proto_vec)
-                                    <= float(getattr(self, "long_update_cos_thresh", 0.15)))
-                        if safe and (int(lost_trk.id) not in getattr(self, "_idswap_locked_ids", set())):
-                            self._bank_add_feature(lost_trk, feat_for_bank)
-                return True
-
-            return False
-        except Exception:
-            return False
-    
     def _clusters_suspect_holder(self, live_tracks):
-        """
-        Trả về:
-        - clusters: list[list[STrack]] được xác nhận bằng voting suspect-holder
-        - singles_to_split: list[STrack] hết cửa sổ mà không đủ vote -> cần tách ngay
-        """
         n = len(live_tracks)
         if n == 0:
             return [], []
 
-        # Matrix prototype (ID) và feature hiện tại
         P, pvalid = self._build_tracks_bank_matrix(live_tracks)
         F, fvalid = build_feat_matrix(live_tracks, ("curr_feat", "smooth_feat"))
         if P is None or F is None:
@@ -573,10 +657,8 @@ class BotSort(BaseTracker):
         mask = pvalid[:, None] & fvalid[None, :]
         C = np.where(mask, C, 1.0).astype(np.float32, copy=False)
 
-        # cập nhật trạng thái suspect/holder theo cửa sổ thời gian
         pairs, singles_idx = self._update_suspect_holder_state(live_tracks, C, pvalid, fvalid)
 
-        # build cluster từ các cặp đã được xác nhận (đồ thị vô hướng)
         adj = {i: set() for i in range(n)}
         for i, j in pairs:
             adj[i].add(j)
@@ -602,70 +684,71 @@ class BotSort(BaseTracker):
 
         singles_to_split = [live_tracks[k] for k in singles_idx]
         return clusters, singles_to_split
-    
+
     def _update_suspect_holder_state(self, tracks, C, pvalid, fvalid):
-        """
-        Quản lý đếm suspect và voting holder trong cửa sổ, PAUSE toàn bộ khi occluded.
-        Trả về:
-        - pairs: list[(i_idx, j_idx)] các cặp suspect-holder đã xác nhận (>= holder_vote_need)
-        - singles_idx: list[int] index những track hết cửa sổ mà không đủ vote -> cần tách
-        """
         pairs = []
         singles_idx = []
 
         th_self = float(self.long_update_cos_thresh)
         th_hold = float(self.appearance_thresh)
-        consec  = int(getattr(self, "suspect_consec", 5))
-        win     = int(getattr(self, "holder_vote_win", 10))
-        need    = int(getattr(self, "holder_vote_need", 5))
+        consec = int(getattr(self, "suspect_consec", 5))
+        win = int(getattr(self, "holder_vote_win", 10))
+        need = int(getattr(self, "holder_vote_need", 5))
+        max_occ = int(getattr(self, "max_occlusion_frames", 20))
 
-        n = len(tracks)
         for i, t in enumerate(tracks):
-            # init state fields
-            if not hasattr(t, "_suspect_run"):       t._suspect_run = 0
-            if not hasattr(t, "_in_holder_window"):  t._in_holder_window = False
-            if not hasattr(t, "_holder_votes"):      t._holder_votes = {}  # holder_id -> deque
-            if not hasattr(t, "_holder_win_left"):   t._holder_win_left = 0
+            if not hasattr(t, "_suspect_run"): t._suspect_run = 0
+            if not hasattr(t, "_in_holder_window"): t._in_holder_window = False
+            if not hasattr(t, "_holder_votes"): t._holder_votes = {}
+            if not hasattr(t, "_holder_win_left"): t._holder_win_left = 0
+            if not hasattr(t, "_grace_period"): t._grace_period = 0
+            if not hasattr(t, "_occlusion_frames"): t._occlusion_frames = 0
 
-            # --- PAUSE KHI CHE KHUẤT ---
             is_occ = bool(getattr(t, "_is_occluded", False))
-            # reset cờ theo frame để khỏi rò sang frame sau
             t._is_occluded = False
             if is_occ:
-                # Freeze hoàn toàn: không tăng suspect_run, không trừ _holder_win_left, không ghi vote
+                t._occlusion_frames = min(max_occ, t._occlusion_frames + 1)
+            else:
+                t._occlusion_frames = 0
+
+            if is_occ and t._occlusion_frames < max_occ:
                 continue
-            # ----------------------------
 
             if not (pvalid[i] and fvalid[i]):
-                # Không đủ tín hiệu appearance sạch -> reset về trạng thái bình thường
                 t._suspect_run = 0
                 t._in_holder_window = False
                 t._holder_votes.clear()
                 t._holder_win_left = 0
+                t._grace_period = 0
                 continue
 
             self_cost = float(C[i, i])
+            
+            # NEW
+            t._last_self_cost       = self_cost
+            t._last_self_cost_frame = self.frame_count
+
             if self_cost > th_self:
                 t._suspect_run += 1
             else:
-                # trở lại bình thường -> reset
                 t._suspect_run = 0
                 t._in_holder_window = False
                 t._holder_votes.clear()
                 t._holder_win_left = 0
+                t._grace_period = 0
                 continue
 
             if t._suspect_run >= consec:
-                # mở/duy trì cửa sổ vote
                 if not t._in_holder_window:
                     t._in_holder_window = True
                     t._holder_votes = {}
                     t._holder_win_left = win
+                    self._snapshot_track(t)
                 else:
-                    # chỉ trừ thời lượng khi KHÔNG occluded (đã đảm bảo ở trên bằng continue)
-                    t._holder_win_left = max(0, t._holder_win_left - 1)
+                    any_holder_present = any((j != i) and pvalid[j] and fvalid[j] for j in range(len(tracks)))
+                    if any_holder_present:
+                        t._holder_win_left = max(0, t._holder_win_left - 1)
 
-                # cập nhật vote cho tất cả holder ứng viên
                 for j, other in enumerate(tracks):
                     if j == i:
                         continue
@@ -676,7 +759,6 @@ class BotSort(BaseTracker):
                     dq.append(1 if C[i, j] <= th_hold else 0)
                     t._holder_votes[hid] = dq
 
-                # kiểm tra holder thắng
                 best_hid, best_score = None, 0
                 for hid, dq in t._holder_votes.items():
                     s = sum(dq)
@@ -684,33 +766,31 @@ class BotSort(BaseTracker):
                         best_score, best_hid = s, hid
 
                 if best_hid is not None and best_score >= need:
-                    # tìm index j theo best_hid
                     j_idx = next((k for k, o in enumerate(tracks) if int(getattr(o, "id", -1)) == best_hid), None)
                     if j_idx is not None:
                         pairs.append((i, j_idx))
-                    # reset sau khi xác nhận để tránh spam
                     t._in_holder_window = False
                     t._holder_votes.clear()
                     t._holder_win_left = 0
                     t._suspect_run = 0
+                    t._grace_period = 0
                 elif t._holder_win_left == 0:
-                    # thêm grace period để tự recovery
-                    if not hasattr(t, '_grace_period'):
-                        t._grace_period = 3  # 3 frames grace period
-                    if t._grace_period > 0:
-                        t._grace_period -= 1
-                        if self_cost <= th_self:
-                        # self recovery
-                            t._suspect_run = 0
-                            t._in_holder_window = False
-                            t._holder_votes.clear()
-                            t._holder_win_left = 0
-                            t._grace_period = 0
+                    if self_cost <= th_self:
+                        t._suspect_run = 0
+                        t._in_holder_window = False
+                        t._holder_votes.clear()
+                        t._holder_win_left = 0
+                        t._grace_period = 0
+                    else:
+                        if t._grace_period <= 0:
+                            t._grace_period = 3
                         else:
-                            # Hết grace period mới đánh dấu cần split
-                            singles_idx.append(i)
+                            t._grace_period -= 1
+                            if t._grace_period == 0:
+                                singles_idx.append(i)
+
         return pairs, singles_idx
-    
+
     def _apply_idswap_cluster(
         self,
         cluster_tracks,
@@ -720,11 +800,6 @@ class BotSort(BaseTracker):
         refind_stracks,
         img=None
     ):
-        """
-        Hungarian trên cost(F_i, Proto(ID_j)) với i,j trong cụm đã XÁC NHẬN.
-        - Track nào assigned_cost > appearance_thresh -> mark_lost + TẠO TRACK MỚI NGAY.
-        new_tracks_buf: list[(det_like, feat_norm)] để caller activate ngay.
-        """
         m = len(cluster_tracks)
         if m == 0:
             return
@@ -739,82 +814,103 @@ class BotSort(BaseTracker):
         mask = pvalid[:, None] & fvalid[None, :]
         C = np.where(mask, C, 1.0).astype(np.float32, copy=False)
 
-        matches, u_r, u_c = linear_assignment(C, thresh=1.0)
+        matches, u_r, u_c = linear_assignment(C, thresh=self.appearance_thresh)
 
         new_ids = [None] * m
         assigned_cost = [1.0] * m
         for r, c in matches:
             new_ids[r] = int(cluster_tracks[c].id)
             assigned_cost[r] = float(C[r, c])
-        # appearance thresh
+
         ath = float(self.long_update_cos_thresh * 1.2)
 
-        # đổi ID cho những row pass ngưỡng
-        for r in range(m):
-            if new_ids[r] is not None and assigned_cost[r] <= ath:
-                cluster_tracks[r].id = new_ids[r]
+        # Phase 1: process losers
+        lost_pool_now = joint_stracks(self.lost_stracks, lost_stracks)
 
-        # vượt ngưỡng -> mark_lost + tạo new track, đồng thời purge khỏi buffers
         for r in range(m):
-            if assigned_cost[r] > ath:
+            if new_ids[r] is None or assigned_cost[r] > ath:
                 t = cluster_tracks[r]
-                if t.state != TrackState.Lost:
-                    t.mark_lost()
-                    t._just_lost_in_frame = self.frame_count
-                    lost_stracks.append(t)
 
-                # gỡ khỏi active ngay
-                if t in self.active_tracks:
-                    self.active_tracks.remove(t)
+                if self._try_match_single_to_lost_long_only(t, lost_pool_now, img=img):
+                    self._idsd_mark_lost(t, lost_stracks, reason="cluster_reclaim")
+                    continue
 
-                # gỡ khỏi các buffer hiện hành (tránh joint_stracks add lại)
-                if activated_stracks is not None:
-                    activated_stracks[:] = [a for a in activated_stracks if a is not t and getattr(a, "id", None) != getattr(t, "id", None)]
-                if refind_stracks is not None:
-                    refind_stracks[:] = [a for a in refind_stracks if a is not t and getattr(a, "id", None) != getattr(t, "id", None)]
+                self._idsd_mark_lost(t, lost_stracks, reason="cluster_newid")
 
-                # cooldown nếu bật
-                if getattr(self, "use_cooldown", False):
-                    t.no_motion_until = self.frame_count + getattr(self, "no_motion_cooldown", 5)
-
-                # Tạo track mới từ box/feat hiện tại
                 f = self._feat_of(t)
                 if f is not None:
                     f = f.astype(np.float32, copy=False)
                     f /= (np.linalg.norm(f) + 1e-6)
+
                 det_like = np.array([*t.xyxy, getattr(t, 'conf', 1.0), getattr(t, 'cls', 0), -1], dtype=np.float32)
                 new_tracks_buf.append((det_like, f))
 
+        # Phase 2: assign winners
+        for r in range(m):
+            if new_ids[r] is not None and assigned_cost[r] <= ath:
+                cluster_tracks[r].id = new_ids[r]
+
     def _handle_single_suspect_recovery(self, track):
-        """
-        Cố gắng khôi phục ID gốc cho track suspect đơn lẻ
-        Trả về True nếu có thể recovery, False nếu cần tạo mới
-        """
-        # Lấy prototype gốc từ bank
-        proto, proto_valid = self._bank_centroid_for_track(track)
-        if not proto_valid or proto is None:
+        if getattr(track, "_last_self_cost_frame", -1) != self.frame_count:
             return False
-            
-        # Lấy feature hiện tại
-        curr_feat = self._feat_of(track)
-        if curr_feat is None:
-            return False
-            
-        # Tính cost với chính prototype gốc của nó
-        self_cost = self._cos_cost_simple(curr_feat, proto)
         
-        # Nếu cost không quá tệ, cho phép recovery
-        recovery_thresh = self.long_update_cos_thresh * 1.2  # Nới lỏng hơn một chút
+        self_cost = float(getattr(track, "_last_self_cost", 1.0))
         
-        if self_cost <= recovery_thresh:
-            # Reset trạng thái suspect và giữ nguyên ID
-            track._suspect_run = 0
+        sc_adj = float(self.self_recover_scale) * self_cost
+        recovery_thresh = float(self.long_update_cos_thresh) * 1.2
+        
+        if sc_adj <= recovery_thresh:
+            track._suspect_run      = 0
             track._in_holder_window = False
-            track._holder_votes.clear()
-            track._holder_win_left = 0
+            track._holder_win_left  = 0
+            track._snapshot         = None
+            track._snap_taken       = False
+            (getattr(track, "_holder_votes", {}) or {}).clear()
             return True
-        
         return False
+
+    def _track_det_topk_cost_row_optimized(self, V, D, dvalid, k=8):
+        N = D.shape[0] if D is not None else 0
+        if V is None or N == 0:
+            return np.ones(N, dtype=np.float32)
+        
+        # Single matrix multiplication
+        S = np.dot(V, D.T)
+        np.clip(S, -1.0, 1.0, out=S)
+        
+        k_use = min(k, S.shape[0])
+        if k_use <= 0:
+            return np.ones(N, dtype=np.float32)
+        
+        # Optimized top-k selection
+        if k_use < S.shape[0]:
+            # Use partition instead of sort for better performance
+            topk_indices = np.argpartition(S, -k_use, axis=0)[-k_use:]
+            topk_values = S[topk_indices, np.arange(N)]
+            sims = np.mean(topk_values, axis=0)
+        else:
+            sims = np.mean(S, axis=0)
+        
+        # Vectorized cost computation
+        cost = 0.5 * (1.0 - sims)
+        return np.where(dvalid, cost, 1.0).astype(np.float32, copy=False)
+
+    def _compute_long_cost(self, tracks, dets):
+        M, N = len(tracks), len(dets)
+        if M == 0 or N == 0:
+            return np.ones((M, N), dtype=np.float32)
+
+        D, dvalid = build_feat_matrix(dets, ("smooth_feat", "curr_feat"))
+
+        C = np.ones((M, N), dtype=np.float32)
+        for i, t in enumerate(tracks):
+            V = self._get_cached_topk_vectors(t, self.long_bank_topk)
+            if V is None or V.size == 0:
+                continue
+            row = self._track_det_topk_cost_row_optimized(V, D, dvalid, self.long_bank_topk)
+            C[i, :] = row
+
+        return np.clip(C, 0.0, 1.0)          
 
     @BaseTracker.setup_decorator
     @BaseTracker.per_class_decorator
@@ -824,7 +920,7 @@ class BotSort(BaseTracker):
         """Main tracking update function."""
         self.check_inputs(dets, img, embs)
         self.frame_count += 1
-
+        
         activated_stracks, refind_stracks, lost_stracks, removed_stracks = [], [], [], []
 
         # --- 1. Preprocess detections ---
@@ -871,7 +967,7 @@ class BotSort(BaseTracker):
         )
 
         # === Collect unmatched detections
-        feats_for_pending = []
+        feats_for_pending  = []
         raw_unmatched_dets = []
         
         # From first tier (high confidence)
@@ -879,9 +975,7 @@ class BotSort(BaseTracker):
             det_box = dets_first[idx]
             raw_unmatched_dets.append(det_box)
             if self.with_reid and idx < len(features_high):
-                f = features_high[idx].astype(np.float32, copy=False)
-                f /= (np.linalg.norm(f) + 1e-6)
-                feats_for_pending.append(f)
+                feats_for_pending.append(features_high[idx].astype(np.float32, copy=False))
             else:
                 feats_for_pending.append(None)
                 
@@ -889,28 +983,25 @@ class BotSort(BaseTracker):
         for idx in u_detection_second:
             raw_unmatched_dets.append(dets_second[idx])
             if self.with_reid and (features_second is not None) and idx < len(features_second):
-                f = features_second[idx].astype(np.float32, copy=False)
-                f /= (np.linalg.norm(f) + 1e-6)
-                feats_for_pending.append(f)
+                feats_for_pending.append(features_second[idx].astype(np.float32, copy=False))
             else:
                 if self.with_reid and self.model is not None and embs is None:
                     try:
                         roi = dets_second[idx, 0:4]
-                        f = self.model.get_features(np.asarray([roi]), img)[0]
-                        f = f.astype(np.float32, copy=False)
-                        f /= (np.linalg.norm(f) + 1e-6)
+                        f = self.model.get_features(np.asarray([roi]), img)[0].astype(np.float32, copy=False)
                         feats_for_pending.append(f)
                     except Exception:
                         feats_for_pending.append(None)
                 else:
                     feats_for_pending.append(None)
 
-        # --- 4. Suspect–Holder voting & cluster ---
+        lost_pool = joint_stracks(self.lost_stracks, lost_stracks)
+
+        # --- 4.5. Suspect–Holder voting & cluster (IDSD-like) ---
         live_tracks = [t for t in self.active_tracks if t.state == TrackState.Tracked]
 
         clusters, singles_to_split = self._clusters_suspect_holder(live_tracks)
 
-        # khoá coexistence cho các ID trong cluster xác nhận
         if clusters:
             self._idswap_locked_ids = set()
             for cl in clusters:
@@ -918,20 +1009,16 @@ class BotSort(BaseTracker):
                     if getattr(t, "id", None) is not None:
                         self._idswap_locked_ids.add(int(t.id))
 
-            # chạy assignment theo cụm và TẠO TRACK MỚI NGAY cho phần vượt ngưỡng
-            new_tracks_buf = []  # (det_like, feat_norm)
+            new_tracks_buf = []
             for cl in clusters:
                 self._apply_idswap_cluster(cl, new_tracks_buf, lost_stracks, activated_stracks=activated_stracks, refind_stracks=refind_stracks, img=img)
 
-            # vệ sinh buffers theo id các track vừa bị đấy sang lost
             if lost_stracks:
                 _lost_ids = {int(getattr(t, "id", -1)) for t in lost_stracks if getattr(t, "id", None) is not None}
                 if _lost_ids:
                     activated_stracks[:] = [a for a in activated_stracks if int(getattr(a, "id", -1)) not in _lost_ids]
                     refind_stracks[:]    = [a for a in refind_stracks    if int(getattr(a, "id", -1)) not in _lost_ids]
-                    # và đảm bảo chúng cũng không còn trong active_tracks
                     self.active_tracks[:] = [a for a in self.active_tracks if int(getattr(a, "id", -1)) not in _lost_ids]
-                    
             for det_like, feat in new_tracks_buf:
                 trk = STrack(det_like, feat, max_obs=self.max_obs)
                 trk.activate(self.kalman_filter, self.frame_count, img=img)
@@ -939,37 +1026,38 @@ class BotSort(BaseTracker):
                 if self.with_reid and feat is not None:
                     self._bank_add_feature(trk, feat)
 
-        # xử lý singleton hết cửa sổ mà không đủ vote -> mark_lost + tạo track mới
+        # handle singles_to_split
+        lost_pool = joint_stracks(self.lost_stracks, lost_stracks)
         for t in singles_to_split:
             if self._handle_single_suspect_recovery(t):
-                # Recovery thành công, giữ nguyên track
                 continue
-            if t.state != TrackState.Lost:
-                t.mark_lost()
-                lost_stracks.append(t)
-            if getattr(self, "use_cooldown", False):
-                t.no_motion_until = self.frame_count + getattr(self, "no_motion_cooldown", 5)
-            # Tạo track mới
+            if self._try_match_single_to_lost_long_only(t, lost_pool, img=img):
+                self._idsd_mark_lost(t, lost_stracks, reason="single_reclaim")
+                continue
+            self._idsd_mark_lost(t, lost_stracks, reason="single_newid")
             f = self._feat_of(t)
             if f is not None:
                 f = f.astype(np.float32, copy=False)
                 f /= (np.linalg.norm(f) + 1e-6)
             det_like = np.array([*t.xyxy, getattr(t, 'conf', 1.0), getattr(t, 'cls', 0), -1], dtype=np.float32)
-            trk = STrack(det_like, f, max_obs=self.max_obs)
-            trk.activate(self.kalman_filter, self.frame_count, img=img)
-            activated_stracks.append(trk)
+            new_trk = STrack(det_like, f, max_obs=self.max_obs)
+            new_trk.activate(self.kalman_filter, self.frame_count, img=img)
+            activated_stracks.append(new_trk)
             if self.with_reid and f is not None:
-                self._bank_add_feature(trk, f)
+                self._bank_add_feature(new_trk, f)
 
-        
-        lost_pool = joint_stracks(self.lost_stracks, lost_stracks)
-        
-        
+        if lost_stracks:
+            _lost_ids = {int(getattr(t, "id", -1)) for t in lost_stracks if getattr(t, "id", None) is not None}
+            if _lost_ids:
+                activated_stracks[:]  = [a for a in activated_stracks  if int(getattr(a, "id", -1)) not in _lost_ids]
+                refind_stracks[:]     = [a for a in refind_stracks     if int(getattr(a, "id", -1)) not in _lost_ids]
+                self.active_tracks[:] = [a for a in self.active_tracks if int(getattr(a, "id", -1)) not in _lost_ids]
+
         # --- 5. Update Pending ---
         live_tracks = [t for t in self.active_tracks if t.state == TrackState.Tracked]
-        other_tracks = live_tracks + [
+        other_tracks = live_tracks + list(activated_stracks) + [
             STrack(det, f) for det, f in zip(raw_unmatched_dets, feats_for_pending) if det is not None
-        ]
+        ]        
         
         unmatched_dets, unmatched_feats, merged_to_lost = self.pending_manager.update_pending(
             raw_unmatched_dets,
@@ -980,16 +1068,32 @@ class BotSort(BaseTracker):
             img         =img,
             other_tracks=other_tracks
         )
-            
+
         # --- 6. Add new pending ---
         if unmatched_dets:
             self.pending_manager.add_pending(unmatched_dets, self.frame_count, feats=unmatched_feats, img=img)
+        
+        # --- 6.5. Cập nhật coexistence cho frame hiện tại (trước khi promote) ---
+        try:
+            live_now = [t for t in self.active_tracks if t.state == TrackState.Tracked]
+            # thêm các track vừa khẳng định lại trong frame này
+            live_now += [t for t in activated_stracks if t.state == TrackState.Tracked]
+            live_now += [t for t in refind_stracks    if t.state == TrackState.Tracked]
+            if live_now:
+                self._update_coexistence_simple(live_now)
+        except Exception as e:
+            print(f"Error updating coexistence (pre-promote): {e}")
             
         # --- 7. Promote pending ---
         promotables = self.pending_manager.promote_pending(self.frame_count)
 
         if promotables:
-            lost_map = {t.id: t for t in self.lost_stracks}
+            lost_map = {}
+            
+            for t in (self.lost_stracks + lost_stracks):
+                if getattr(t, "id", None) is not None:
+                    lost_map[int(t.id)] = t
+                    
             min_frames = getattr(self.pending_manager, "promote_min_frames_for_lost", 5)
             
             for p_track in promotables:
@@ -1037,86 +1141,65 @@ class BotSort(BaseTracker):
                     # 3. Coexistence filtering for canonical_id
                     coex = self.coex_map
                     coex_set = coex.get(int(canonical_id), set())
-                
-                    # Check if canonical conflicts with any merge_id
-                    conflicted = any((other != canonical_id) and (other in coex_set) 
-                                     for other in ([canonical_id] + merge_ids))
-                
-                    if conflicted:
-                    # Conflict after resolve - create new track
-                        feat_for_strack = (
-                            p_track.smooth_feat if getattr(p_track, "smooth_feat", None) is not None
-                            else getattr(p_track, "curr_feat", None)
-                        )
-                        if feat_for_strack is not None:
-                            feat_for_strack = feat_for_strack / np.clip(np.linalg.norm(feat_for_strack), 1e-6, None)
-
-                        new_track = STrack(np.array([*p_track.xyxy, p_track.conf, p_track.cls, -1]), feat=feat_for_strack)
-                        new_track.activate(self.kalman_filter, self.frame_count, img=img)
-                        activated_stracks.append(new_track)
-                        continue
                     
-                    # Re-activate với canonical ID
+                    # chỉ lọc các merge_ids bị xung đột với canonical
+                    safe_merge_ids   = [mid for mid in merge_ids if mid not in coex_set]
+                    conflict_ids     = [mid for mid in merge_ids if mid in coex_set]
+
+                    # luôn re-activate canonical_id
                     root_trk = lost_map[canonical_id]
                     root_trk.re_activate(p_track, self.frame_count, new_id=False, img=img)
                     refind_stracks.append(root_trk)
                     del lost_map[canonical_id]
 
-                    # --- Push 1 vector về bank sau khi re-active canonical ID ---
+                    # (tuỳ chọn) log cho dễ debug
+                    print(f"[PROMOTE] canonical={canonical_id}, merge={safe_merge_ids}, filtered_by_coex={conflict_ids}")
+
+                    # --- push 1 vector vào bank như cũ ---
                     try:
                         if self.long_bank is not None and self.with_reid:
-                            # Ưu tiên feat sau re-activate (đã đi qua pipeline chuẩn hoá của STrack)
-                            feat_for_bank = getattr(root_trk, "curr_feat", None)
-
-                            # Fallback: lấy từ pending nếu cần
-                            if feat_for_bank is None:
-                                feat_for_bank = (getattr(p_track, "smooth_feat", None) 
-                                                or getattr(p_track, "curr_feat", None))
+                            feat_for_bank = first_not_none(
+                                getattr(root_trk, "curr_feat", None),
+                                getattr(p_track, "smooth_feat", None),
+                                getattr(p_track, "curr_feat", None),
+                            )
 
                             if feat_for_bank is not None:
-                                proto_vec, ok = self._bank_centroid_for_track(root_trk)
-                                safe_to_push = True
-                                if ok and proto_vec is not None:
-                                    cos_cost = self._cos_cost_simple(feat_for_bank, proto_vec)
-                                    safe_to_push = (cos_cost <= float(getattr(self, "long_update_cos_thresh", 0.15)))
-                                    # safe_to_push = True
-
-                                if safe_to_push and (not hasattr(self, "_idswap_locked_ids") 
-                                                    or int(root_trk.id) not in self._idswap_locked_ids):
-                                    self._bank_add_feature(root_trk, feat_for_bank)
+                                self._bank_add_feature(root_trk, feat_for_bank)
                     except Exception as e:
                         print(f"[LongBank] post-reactivate push failed for id={getattr(root_trk,'id',-1)}: {e}")
-                    
-                    # Merge fragments into canonical
-                    if merge_ids:
-                        for merge_id in merge_ids:
-                            if merge_id in lost_map:
-                                merge_track = lost_map[merge_id]
+
+                    # chỉ merge các ID không xung đột
+                    for merge_id in safe_merge_ids:
+                        if merge_id in lost_map:
+                            merge_track = lost_map[merge_id]
+                            # merge feature histories (như code cũ)
+                            merge_long     = getattr(merge_track, "long_feat_mean", None)
+                            canonical_long = getattr(root_trk,  "long_feat_mean", None)
+                            if merge_long is not None:
+                                if canonical_long is None:
+                                    root_trk.long_feat_mean = merge_long.copy()
+                                else:
+                                    weight = 0.3
+                                    root_trk.long_feat_mean = (1 - weight) * canonical_long + weight * merge_long
+                                    nrm = np.linalg.norm(root_trk.long_feat_mean)
+                                    if nrm > 1e-6:
+                                        root_trk.long_feat_mean /= nrm
+
+                            self.lost_stracks = [t for t in self.lost_stracks if t.id != merge_id]
+                            del lost_map[merge_id]
+                            self._purge_from_coex([merge_id])
+                            
+                            if self.long_bank is not None:
+                                try:
+                                    self.long_bank.delete_track(self.run_uid, int(merge_id))
+                                except Exception as e:
+                                    print(f"[LongBank] delete merge id = {merge_id} failed: {e}")
                                 
-                                # Merge feature histories
-                                merge_long     = getattr(merge_track, "long_feat_mean", None)
-                                canonical_long = getattr(root_trk, "long_feat_mean", None)
-                                
-                                if merge_long is not None:
-                                    if canonical_long is None:
-                                        root_trk.long_feat_mean = merge_long.copy()
-                                    else:
-                                        # Weighted average
-                                        weight = 0.3
-                                        root_trk.long_feat_mean = (
-                                            (1 - weight) * canonical_long + weight * merge_long
-                                        )
-                                        # Renormalize
-                                        norm = np.linalg.norm(root_trk.long_feat_mean)
-                                        if norm > 1e-6:
-                                            root_trk.long_feat_mean /= norm
-                                
-                                # Remove merged track
-                                self.lost_stracks = [t for t in self.lost_stracks if t.id != merge_id]
-                                del lost_map[merge_id]
-                                
-                                # Clean coexistence map
-                                self._purge_from_coex([merge_id])
+                            # dọn cache cục bộ
+                            self._slot_pos.pop(int(merge_id), None)
+                            self._bank_proto_cache.pop(int(merge_id), None)
+                            self._frame_cache_bank.pop(int(merge_id), None)
                                 
                 except Exception as e:
                     print(f"Error promoting pending track: {e}")
@@ -1136,10 +1219,7 @@ class BotSort(BaseTracker):
             self._update_coexistence_simple([t for t in self.active_tracks if t.state == TrackState.Tracked])
         except Exception as e:
             print(f"Error updating coexistence: {e}")
-        finally:
-            # bỏ khóa sau frame
-            if hasattr(self, "_idswap_locked_ids"):
-                self._idswap_locked_ids.clear()
+
         return outputs, logs, tracks_for_visual, pending_tracks
 
     def _split_detections(self, dets, embs):
@@ -1209,6 +1289,12 @@ class BotSort(BaseTracker):
         STrack.multi_gmc(strack_pool, warp)
         STrack.multi_gmc(unconfirmed, warp)
 
+        # Build occlusion cache with latest predicted boxes (Tracked + Pending predicted)
+        try:
+            self._build_overlap_cache_for_frame()
+        except Exception:
+            pass
+            
         # IoU distance
         ious_dists = iou_distance(strack_pool, detections)
         ious_dists_mask = ious_dists > self.proximity_thresh
@@ -1256,19 +1342,10 @@ class BotSort(BaseTracker):
             track.long_reid_cost = float(long_cost[itracked, idet])
             track.final_cost     = float(C[itracked, idet])
                  
-            # Build context occlusion: active + pending (đã predict), lọc theo class nếu cần
-            cls_ref = getattr(track, "cls", None) if self.per_class else None
-            other_tracks_for_occlusion = self._occlusion_context(
-                exclude_id=getattr(track, "id", None),
-                cls_ref=cls_ref,
-                predict_pending=True,
-            )
-            
             # Check update permissions
             allow_short, allow_long, occluded = self.allow_update(
                 long_cost[itracked, idet] if self.with_reid else None,
                 track,
-                other_tracks=other_tracks_for_occlusion
             )
             
             track._is_occluded = bool(occluded)
@@ -1289,9 +1366,8 @@ class BotSort(BaseTracker):
                 refind_stracks.append(track)
 
             if allow_long and self.with_reid:
-                if int(getattr(track, "id", -1)) not in getattr(self, "_idswap_locked_ids", set()):
-                    src_feat = first_not_none(getattr(det, "curr_feat", None), getattr(track, "curr_feat", None))
-                    self._bank_add_feature(track, src_feat)
+                src_feat = first_not_none(getattr(det, "curr_feat", None), getattr(track, "curr_feat", None))
+                self._bank_add_feature(track, src_feat)
             
         return matches, u_track, u_detection
 
@@ -1375,17 +1451,9 @@ class BotSort(BaseTracker):
             track.reid_cost      = float(reid_cost_mat[itracked, idet]) if reid_cost_mat is not None else 1.0
             track.long_reid_cost = float(long_cost_mat[itracked, idet]) if long_cost_mat is not None else float("nan")
 
-            # NEW: tính occlusion và gắn cờ để pause suspect/window ở tầng voting
-            cls_ref = getattr(track, "cls", None) if self.per_class else None
-            other_tracks_for_occlusion = self._occlusion_context(
-                exclude_id=getattr(track, "id", None),
-                cls_ref=cls_ref,
-                predict_pending=True,
-            )
             _, _, occluded2 = self.allow_update(
-                long_val=None,              # vòng 2 không cần long_val
+                long_val=None,
                 track=track,
-                other_tracks=other_tracks_for_occlusion,
             )
             track._is_occluded = bool(occluded2)
 
@@ -1425,7 +1493,6 @@ class BotSort(BaseTracker):
         self.active_tracks = joint_stracks(self.active_tracks, activated_stracks)
         self.active_tracks = joint_stracks(self.active_tracks, refind_stracks)
         
-        
         # --- dedup active by id: lấy track có frame_id mới nhất
         uniq = {}
         for t in (self.active_tracks or []):
@@ -1443,35 +1510,49 @@ class BotSort(BaseTracker):
             self.lost_stracks[:] = [t for t in self.lost_stracks if int(getattr(t, "id", -1)) not in active_ids]
         
         # Update lost tracks
-        self.lost_stracks  = sub_stracks(self.lost_stracks, self.active_tracks)
+        self.lost_stracks = sub_stracks(self.lost_stracks, self.active_tracks)
         self.lost_stracks.extend(lost_stracks)
 
-        # Handle removed tracks
         self.removed_stracks.extend(removed_stracks)
+        
+        removed_batch = removed_stracks
+        # Purge coexistence        
         try:
-            to_purge = {int(t.id) for t in self.removed_stracks if getattr(t, "id", None) is not None}
-            self._purge_from_coex(to_purge)
+            to_purge = {
+                int(t.id) for t in self.removed_stracks 
+                if getattr(t, "id", None) is not None
+            }
+            if to_purge:
+                self._purge_from_coex(to_purge)
         except Exception as e:
             print(f"Error purging removed tracks: {e}")
             
-        # --- delete vectors in bank for removed tracks (ADD) ---
+        # 2) Xóa vectors/caches trong LongBank cho removed IDs
         if self.long_bank is not None:
             for t in removed_stracks:
                 try:
                     if getattr(t, "id", None) is not None:
+                        tid = int(t.id)
                         self.long_bank.delete_track(self.run_uid, int(t.id))
                         self._slot_pos.pop(int(t.id), None)
                         self._bank_proto_cache.pop(int(t.id), None)
+                        self._frame_cache_bank.pop(tid, None)
                 except Exception as e:
                     print(f"[LongBank] delete id={getattr(t,'id',-1)} failed: {e}")
-        # -------------------------------------------------------
         
-        self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
+        # 3) Giải phóng ảnh trên các track vừa removed
+        for t in removed_batch:
+            try:
+                if hasattr(t, "latest_image"): t.latest_image = None
+                if hasattr(t, "first_image"):  t.first_image  = None
+            except Exception:
+                pass
         
-        # Remove duplicates
-        # self.active_tracks, self.lost_stracks = remove_duplicate_stracks_with_coex(
-        #     self.active_tracks, self.lost_stracks, iou_thr=0.15, coex_map=self.coex_map
-        # )
+        # 4) Loại lost theo batch removed
+        self.lost_stracks = sub_stracks(self.lost_stracks, removed_batch)
+        
+        # 5) không tích lũy lịch sử removed
+        self.removed_stracks = []        
         
         # Prepare output arrays
         outputs = []
@@ -1505,29 +1586,3 @@ class BotSort(BaseTracker):
 
         return np.asarray(outputs, dtype=np.float32) if outputs else np.empty((0, 8), dtype=np.float32), logs, tracks_for_visual
                    
-    def _max_overlap_ratio(self, track, other_tracks):
-        """Calculate max overlap ratio between track and other tracks."""
-        try:
-            box1 = track.xyxy
-            area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-            max_ratio = 0.0
-
-            for other in other_tracks:
-                if getattr(other, 'id', None) == getattr(track, 'id', None):
-                    continue
-                if not hasattr(other, 'xyxy'):
-                    continue
-                
-                box2 = other.xyxy
-                xA = max(box1[0], box2[0])
-                yA = max(box1[1], box2[1])
-                xB = min(box1[2], box2[2])
-                yB = min(box1[3], box2[3])
-                inter_area = max(0, xB - xA) * max(0, yB - yA)
-                if inter_area > 0:
-                    ratio = inter_area / area1
-                    if ratio > max_ratio:
-                        max_ratio = ratio
-            return max_ratio
-        except Exception:
-            return 0.0

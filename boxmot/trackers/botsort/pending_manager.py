@@ -28,7 +28,7 @@ def iou(bbox1, bbox2):
 class PendingTrack(BaseTrack):
     shared_kalman = KalmanFilterXYWH()
     
-    def __init__(self, det, frame_id, feat=None, min_lost_matches_to_promote=5, promotion_deadline=15):
+    def __init__(self, det, frame_id, feat=None, promotion_deadline=15):
         """
         Initialize pending track.
         Args:
@@ -54,7 +54,6 @@ class PendingTrack(BaseTrack):
         self.start_frame  = frame_id
         self.is_activated = False
         
-        self.min_lost_matches_to_promote = min_lost_matches_to_promote
         self.promotion_deadline          = promotion_deadline
         
         # Feature handling
@@ -165,7 +164,7 @@ class PendingTrack(BaseTrack):
             return np.array([0, 0, 1, 1], dtype=np.float32)
 
 class PendingManager:
-    def __init__(self, kalman_filter, min_lost_matches_to_promote=3, promotion_deadline=30,
+    def __init__(self, kalman_filter, promotion_deadline=15,
                  iou_thresh=0.7, appearance_thresh=0.1, match_thresh=0.8, use_dynamic_weights=True,
                 w_motion_base=0.6, w_motion_start_dw=0.6, dw_start_frames=20, dw_step_frames=20,
                 dw_step_delta=0.05, reid_dim=None, dw_app_split=0.5, promote_min_frames_for_lost=5, 
@@ -173,7 +172,6 @@ class PendingManager:
                 qdrant_group_provider=None):
         self.pending_tracks = []
         self.kalman_filter  = kalman_filter
-        self.min_lost_matches_to_promote = min_lost_matches_to_promote
         self.promotion_deadline = promotion_deadline
         self.iou_thresh         = iou_thresh
         self.appearance_thresh  = appearance_thresh
@@ -191,9 +189,10 @@ class PendingManager:
         self.promote_min_frames_for_lost = int(promote_min_frames_for_lost)
         self.proto_provider      = proto_provider
         self.vectors_provider    = vectors_provider
-        self.long_bank_topk         = int(long_bank_topk)
+        self.long_bank_topk      = int(long_bank_topk)
         
         self.debug_pending_lost  = bool(debug_pending_lost)
+        self.debug_pending_lost  = True
         
         # New: Use qdrant server
         self.qdrant_group_provider = qdrant_group_provider 
@@ -254,7 +253,6 @@ class PendingManager:
                 feat  = feats[i] if feats is not None else None
                 track = PendingTrack(
                     det, frame_id, feat=feat,
-                    min_lost_matches_to_promote=self.min_lost_matches_to_promote,
                     promotion_deadline=self.promotion_deadline
                 )
                 track.activate(self.kalman_filter)
@@ -523,7 +521,6 @@ class PendingManager:
         # 2) Pending vs Lost Tracks matching (accumulation only)
         if lost_tracks:
             try:
-                print(f"[DBG][frame={frame_id}] PM: Processing {len(lost_tracks)} lost tracks")
                 lost_boxes    = np.array([t.xyxy for t in lost_tracks], dtype=np.float32)
                 
                 iou_cost = self._iou_cost(pending_boxes, lost_boxes)

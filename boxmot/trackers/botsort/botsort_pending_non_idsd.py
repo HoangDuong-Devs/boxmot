@@ -121,7 +121,7 @@ class BotSort(BaseTracker):
         self.dw_step_delta   = 0.05
         
         self.occlusion_overlap_thresh = 0.45 # Diện tích bị che -> không cập nhật
-        self.long_update_cos_thresh = 0.12   # Feature drift    -> không cập nhật
+        self.long_update_cos_thresh   = 0.12 # Feature drift    -> không cập nhật
         self.max_obs = 50
         
         reid_dim = getattr(self.model, "feature_dim", 512) if self.with_reid and self.model else None
@@ -132,9 +132,8 @@ class BotSort(BaseTracker):
         self.run_uid    = _uuid.uuid4().hex[:8]
         self.bank_slots = int(bank_slots)
 
-        # cache & ring-slot cho từng track id
+        # Ring-slot cho từng track id
         self._slot_pos           = {}
-        
         # Centroid cache (TTL=5f): giảm fetch/tính mean; clear khi add new feat.
         self._bank_proto_cache   = {} 
         self._bank_proto_ttl     = 5 
@@ -598,7 +597,7 @@ class BotSort(BaseTracker):
             live_now = [t for t in self.active_tracks if t.state == TrackState.Tracked]
             # thêm các track vừa khẳng định lại trong frame này
             live_now += [t for t in activated_stracks if t.state == TrackState.Tracked]
-            live_now += [t for t in refind_stracks     if t.state == TrackState.Tracked]
+            live_now += [t for t in refind_stracks    if t.state == TrackState.Tracked]
             if live_now:
                 self._update_coexistence_simple(live_now)
         except Exception as e:
@@ -808,7 +807,6 @@ class BotSort(BaseTracker):
         warp = self.cmc.apply(img, dets[:, :4])
         STrack.multi_gmc(strack_pool, warp)
         STrack.multi_gmc(unconfirmed, warp)
-
 
         # Build occlusion cache with latest predicted boxes (Tracked + Pending predicted)
         try:
